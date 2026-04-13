@@ -12,7 +12,7 @@ Steps:
 import logging
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
 import anthropic
@@ -130,7 +130,7 @@ async def research_problem(tweet: Tweet) -> Optional[Problem]:
         existing_solutions = existing,
         market_signals     = signals,
         viability_score    = score,
-        researched_at      = datetime.utcnow(),
+        researched_at      = datetime.now(timezone.utc),
     )
     async with get_session() as session:
         session.add(problem)

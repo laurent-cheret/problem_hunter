@@ -93,7 +93,7 @@ async def classify_tweets(tweets: List[Tweet]) -> List[Tweet]:
     3. Persist scores to DB
     Returns tweets that passed (problem_score >= MIN_PROBLEM_SCORE and is_buildable).
     """
-    from datetime import datetime
+    from datetime import datetime, timezone
     from config import MIN_PROBLEM_SCORE
     from database.db import get_session
 
@@ -121,7 +121,7 @@ async def classify_tweets(tweets: List[Tweet]) -> List[Tweet]:
                 tweet.problem_score    = score
                 tweet.is_buildable     = buildable
                 tweet.problem_summary  = summary
-                tweet.classified_at    = datetime.utcnow()
+                tweet.classified_at    = datetime.now(timezone.utc)
 
                 if score >= MIN_PROBLEM_SCORE and buildable:
                     tweet.status = "classified"

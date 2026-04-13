@@ -13,7 +13,7 @@ Daily cap (MAX_DAILY_REPORTS) is enforced here to control spend.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import anthropic
@@ -155,7 +155,7 @@ async def generate_report(problem: Problem) -> Optional[str]:
         )
         p = result.scalar_one()
         p.report_markdown     = report_md
-        p.report_generated_at = datetime.utcnow()
+        p.report_generated_at = datetime.now(timezone.utc)
         session.add(p)
 
         t_result = await session.execute(

@@ -15,7 +15,7 @@ The bot is notification-only (push). No commands needed for MVP.
 import logging
 import io
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from telegram import Bot
@@ -84,7 +84,7 @@ async def _send_document(filename: str, content: str, caption: str = "") -> bool
 # ─── Notification helpers ────────────────────────────────────────────────────
 
 async def notify_scan_start(target_count: int) -> None:
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     await _send(
         f"🔍 *Scan started* \\— {_escape(ts)}\n"
         f"Checking {target_count} accounts\\.\\.\\.",
@@ -144,12 +144,12 @@ async def notify_report_ready(problem: Problem, tweet: Tweet, report_md: str) ->
             result = await session.execute(select(P).where(P.id == problem.id))
             p = result.scalar_one()
             p.telegram_sent    = True
-            p.telegram_sent_at = datetime.utcnow()
+            p.telegram_sent_at = datetime.now(timezone.utc)
             session.add(p)
 
 
 async def notify_no_findings() -> None:
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     await _send(
         f"😴 *No significant problems found* in this scan \\({_escape(ts)}\\)\\.\n"
         f"System is running normally\\.",
