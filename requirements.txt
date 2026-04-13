@@ -2,8 +2,8 @@
 anthropic>=0.30.0
 python-dotenv>=1.0.0
 
-# HTTP client (used for X scraping directly — no twikit needed)
-httpx>=0.28.0
+# Browser-based scraping (headless Chromium — more reliable than X API)
+playwright>=1.44.0
 
 # Web research
 duckduckgo-search>=6.2.0
@@ -17,3 +17,6 @@ asyncpg>=0.29.0
 
 # Scheduler
 apscheduler>=3.10.4
+
+# HTTP client (used by other modules)
+httpx>=0.28.0
