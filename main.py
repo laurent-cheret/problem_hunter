@@ -28,6 +28,7 @@ from bot.telegram_bot import (
     notify_problem_detected, notify_research_result,
     notify_report_ready, notify_no_findings,
     notify_error, notify_quota_reached,
+    notify_fetched_tweets, notify_keyword_filter, notify_haiku_results,
 )
 
 logging.basicConfig(
@@ -65,17 +66,26 @@ async def run_pipeline() -> None:
 
     logger.info(f"{len(new_tweets)} new tweets to process.")
 
+    # Layer 0 visibility — show everything that was fetched
+    await notify_fetched_tweets(new_tweets)
+
     # ── 2. Classify (keyword filter + Haiku) ───────────────────────────────────
     try:
-        problem_tweets = await classify_tweets(new_tweets)
+        problem_tweets, keyword_passed, haiku_results = await classify_tweets(new_tweets)
     except Exception as e:
         logger.error(f"Classifier error: {e}")
         await notify_error("Classifier", str(e))
-        problem_tweets = []
+        problem_tweets, keyword_passed, haiku_results = [], [], []
+
+    # Layer 1 visibility — keyword filter results
+    await notify_keyword_filter(new_tweets, keyword_passed)
+
+    # Layer 2 visibility — Haiku scores for everything that reached classification
+    await notify_haiku_results(haiku_results, problem_tweets)
 
     problems_found = len(problem_tweets)
 
-    # Notify each detected problem
+    # Notify each detected problem (above-threshold ones only)
     for tweet in problem_tweets:
         await notify_problem_detected(tweet, tweet.problem_score or 0)
 

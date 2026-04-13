@@ -89,15 +89,23 @@ async def classify_batch(tweets: List[Tweet]) -> List[Tuple[Tweet, float, bool, 
     return output
 
 
-async def classify_tweets(tweets: List[Tweet]) -> List[Tweet]:
+async def classify_tweets(
+    tweets: List[Tweet],
+) -> tuple:
     """
     Full classification pipeline for a list of tweets.
     1. Keyword pre-filter (free)
     2. Haiku batch classification
     3. Persist scores to DB
-    Returns tweets that passed (problem_score >= MIN_PROBLEM_SCORE and is_buildable).
+
+    Returns:
+        (passed_tweets, keyword_passed, all_haiku_results)
+        - passed_tweets:    Tweet objects that cleared both score threshold and is_buildable
+        - keyword_passed:   Tweet objects that passed the keyword pre-filter
+        - all_haiku_results: list of (Tweet, score, is_buildable, summary) for every tweet
+                             that reached Haiku (for audit/visibility)
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
     from config import MIN_PROBLEM_SCORE
     from database.db import get_session
 
@@ -112,13 +120,16 @@ async def classify_tweets(tweets: List[Tweet]) -> List[Tweet]:
     logger.info(f"Keyword filter: {len(candidates)}/{len(tweets)} tweets passed.")
 
     if not candidates:
-        return []
+        return [], candidates, []
 
     # Step 2: batch Haiku classification
     passed: List[Tweet] = []
+    all_haiku_results: List[Tuple[Tweet, float, bool, str]] = []
+
     for i in range(0, len(candidates), BATCH_SIZE):
         batch = candidates[i : i + BATCH_SIZE]
         results = await classify_batch(batch)
+        all_haiku_results.extend(results)
 
         async with get_session() as session:
             for tweet, score, buildable, summary in results:
@@ -139,4 +150,4 @@ async def classify_tweets(tweets: List[Tweet]) -> List[Tweet]:
                 session.add(tweet)
 
     logger.info(f"Classification done. {len(passed)} problem tweet(s) to research.")
-    return passed
+    return passed, candidates, all_haiku_results

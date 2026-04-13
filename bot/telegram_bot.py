@@ -148,6 +148,101 @@ async def notify_report_ready(problem: Problem, tweet: Tweet, report_md: str) ->
             session.add(p)
 
 
+async def notify_fetched_tweets(tweets: list) -> None:
+    """Send all fetched tweets as a text document so you can audit what was seen."""
+    if not tweets:
+        return
+
+    # Group by author
+    by_author: dict = {}
+    for t in tweets:
+        by_author.setdefault(t.author_username, []).append(t)
+
+    lines = [f"FETCHED TWEETS — {len(tweets)} total\n{'='*50}\n"]
+    for username, ts in by_author.items():
+        lines.append(f"\n@{username} ({len(ts)} tweets):")
+        for t in ts:
+            text_preview = t.text.replace("\n", " ")[:120]
+            lines.append(f"  • {text_preview}")
+            lines.append(f"    {t.tweet_url}")
+
+    content = "\n".join(lines)
+    await _send_document(
+        "fetched_tweets.txt",
+        content,
+        f"📥 Layer 0 — {len(tweets)} tweets fetched from {len(by_author)} accounts",
+    )
+
+
+async def notify_keyword_filter(all_tweets: list, passed: list) -> None:
+    """Show which tweets survived the keyword pre-filter."""
+    total = len(all_tweets)
+    n = len(passed)
+
+    if n == 0:
+        await _send(
+            f"🔎 *Layer 1 — Keyword filter*\n"
+            f"`0 / {total}` tweets passed\\. No problem keywords matched\\.",
+        )
+        return
+
+    lines = [f"🔎 *Layer 1 — Keyword filter*\n`{n} / {total}` tweets passed\n"]
+    for t in passed:
+        preview = _escape(t.text.replace("\n", " ")[:100])
+        lines.append(f"• @{_escape(t.author_username)}: _{preview}_")
+
+    # Telegram limit is 4096; split if needed
+    msg = "\n".join(lines)
+    if len(msg) <= 4000:
+        await _send(msg)
+    else:
+        # Too long — send as document instead
+        plain = f"KEYWORD FILTER — {n}/{total} passed\n\n"
+        for t in passed:
+            plain += f"@{t.author_username}\n{t.text[:200]}\n{t.tweet_url}\n\n"
+        await _send_document(
+            "keyword_filter.txt", plain,
+            f"🔎 Layer 1 — {n}/{total} tweets passed keyword filter",
+        )
+
+
+async def notify_haiku_results(all_results: list, passed: list) -> None:
+    """
+    Show Haiku scores for every tweet that reached classification.
+    all_results: list of (tweet, score, is_buildable, summary)
+    passed: list of Tweet objects that cleared the threshold
+    """
+    if not all_results:
+        return
+
+    passed_ids = {t.id for t in passed}
+    n_passed = len(passed)
+    n_total  = len(all_results)
+
+    lines = [f"🤖 *Layer 2 — Haiku classification*\n`{n_passed} / {n_total}` cleared threshold\n"]
+    for tweet, score, buildable, summary in sorted(all_results, key=lambda x: -x[1]):
+        badge = "✅" if tweet.id in passed_ids else "❌"
+        score_str = f"{score:.1f}"
+        summary_esc = _escape((summary or "")[:80])
+        lines.append(
+            f"{badge} `{score_str}/10` @{_escape(tweet.author_username)}\n"
+            f"    _{summary_esc}_"
+        )
+
+    msg = "\n".join(lines)
+    if len(msg) <= 4000:
+        await _send(msg)
+    else:
+        plain = f"HAIKU SCORES — {n_passed}/{n_total} passed\n\n"
+        for tweet, score, buildable, summary in sorted(all_results, key=lambda x: -x[1]):
+            badge = "PASS" if tweet.id in passed_ids else "SKIP"
+            plain += f"[{badge}] {score:.1f}/10 @{tweet.author_username}: {summary}\n"
+        await _send_document(
+            "haiku_scores.txt", plain,
+            f"🤖 Layer 2 — {n_passed}/{n_total} tweets passed Haiku classification",
+        )
+
+
 async def notify_no_findings() -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     await _send(
