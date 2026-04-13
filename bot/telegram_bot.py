@@ -144,7 +144,7 @@ async def notify_report_ready(problem: Problem, tweet: Tweet, report_md: str) ->
             result = await session.execute(select(P).where(P.id == problem.id))
             p = result.scalar_one()
             p.telegram_sent    = True
-            p.telegram_sent_at = datetime.now(timezone.utc)
+            p.telegram_sent_at = datetime.utcnow()
             session.add(p)
 
 

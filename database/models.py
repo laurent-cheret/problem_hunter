@@ -21,7 +21,7 @@ class Tweet(Base):
     text           = Column(Text, nullable=False)
     tweet_url      = Column(String(512))
     created_at     = Column(DateTime, nullable=False)
-    fetched_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    fetched_at     = Column(DateTime, default=datetime.utcnow)
 
     # Pre-filter result
     passed_keyword_filter = Column(Boolean, default=False)
@@ -50,7 +50,7 @@ class Problem(Base):
 
     id              = Column(Integer, primary_key=True, autoincrement=True)
     tweet_id_fk     = Column(Integer, ForeignKey("tweets.id"), unique=True)
-    created_at      = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at      = Column(DateTime, default=datetime.utcnow)
 
     # Research output
     problem_title       = Column(String(256))

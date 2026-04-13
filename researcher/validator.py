@@ -130,7 +130,7 @@ async def research_problem(tweet: Tweet) -> Optional[Problem]:
         existing_solutions = existing,
         market_signals     = signals,
         viability_score    = score,
-        researched_at      = datetime.now(timezone.utc),
+        researched_at      = datetime.utcnow(),
     )
     async with get_session() as session:
         session.add(problem)

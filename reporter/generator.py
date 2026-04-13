@@ -155,7 +155,7 @@ async def generate_report(problem: Problem) -> Optional[str]:
         )
         p = result.scalar_one()
         p.report_markdown     = report_md
-        p.report_generated_at = datetime.now(timezone.utc)
+        p.report_generated_at = datetime.utcnow()
         session.add(p)
 
         t_result = await session.execute(

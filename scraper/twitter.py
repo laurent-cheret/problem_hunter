@@ -183,6 +183,9 @@ class TwitterScraper:
                 except (ValueError, AttributeError):
                     dt = datetime.now(timezone.utc)
 
+                # Strip tz info — DB columns are TIMESTAMP WITHOUT TIME ZONE
+                dt = dt.replace(tzinfo=None)
+
                 obj = Tweet(
                     tweet_id        = tid,
                     author_name     = t.get("author_name", ""),

@@ -121,7 +121,7 @@ async def classify_tweets(tweets: List[Tweet]) -> List[Tweet]:
                 tweet.problem_score    = score
                 tweet.is_buildable     = buildable
                 tweet.problem_summary  = summary
-                tweet.classified_at    = datetime.now(timezone.utc)
+                tweet.classified_at    = datetime.utcnow()
 
                 if score >= MIN_PROBLEM_SCORE and buildable:
                     tweet.status = "classified"
