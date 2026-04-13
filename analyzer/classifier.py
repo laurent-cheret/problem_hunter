@@ -62,8 +62,12 @@ async def classify_batch(tweets: List[Tweet]) -> List[Tuple[Tweet, float, bool, 
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_msg}],
         )
+        import re
         raw = response.content[0].text.strip()
-        results_json: List[dict] = json.loads(raw)
+        # Strip markdown code fences if the model wrapped the JSON (e.g. ```json ... ```)
+        cleaned = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\n?```$", "", cleaned).strip()
+        results_json: List[dict] = json.loads(cleaned)
     except (json.JSONDecodeError, IndexError) as e:
         logger.error(f"Classifier JSON parse error: {e}. Raw: {raw[:200]}")
         # Fallback: mark all as score 0 so they're skipped

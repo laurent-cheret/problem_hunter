@@ -171,10 +171,12 @@ class TwitterScraper:
             existing = {r[0] for r in result.fetchall()}
 
             new_objs = []
+            seen_in_batch: set = set()
             for t in raw_tweets:
                 tid = t.get("tweet_id", "")
-                if not tid or tid in existing:
+                if not tid or tid in existing or tid in seen_in_batch:
                     continue
+                seen_in_batch.add(tid)
 
                 try:
                     dt = datetime.fromisoformat(
