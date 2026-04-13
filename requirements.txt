@@ -2,8 +2,8 @@
 anthropic>=0.30.0
 python-dotenv>=1.0.0
 
-# X / Twitter scraping
-twikit>=2.1.0
+# HTTP client (used for X scraping directly — no twikit needed)
+httpx>=0.28.0
 
 # Web research
 duckduckgo-search>=6.2.0
@@ -17,6 +17,3 @@ asyncpg>=0.29.0
 
 # Scheduler
 apscheduler>=3.10.4
-
-# Async HTTP (used internally by twikit)
-aiohttp>=3.9.0

@@ -1,10 +1,9 @@
 """
-Twitter/X scraper using twikit (cookie-based, no API fee).
+Twitter/X scraper using direct httpx calls to X's internal API.
+No twikit dependency — avoids the fragile JS transaction signing that keeps breaking.
 
-Flow:
-  1. On first run, logs in with credentials and saves cookies to DB.
-  2. On subsequent runs, loads cookies from DB (or TWITTER_COOKIES_JSON env var).
-  3. Fetches recent tweets per account, returns only new ones (not in DB).
+Uses X's v1.1 REST API with cookie-based auth (the same cookies the browser uses).
+The bearer token below is X's public web-app token, embedded in their JS bundle.
 """
 
 import json
@@ -13,154 +12,113 @@ import asyncio
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from twikit import Client
+import httpx
 from sqlalchemy import select
 
-from config import (
-    TWITTER_USERNAME, TWITTER_EMAIL, TWITTER_PASSWORD,
-    TWITTER_COOKIES_JSON, TWEETS_PER_USER, TARGETS
-)
+from config import TWITTER_COOKIES_JSON, TWEETS_PER_USER, TARGETS
 from database.db import get_session
-from database.models import Tweet, AppSettings
+from database.models import Tweet
 
 logger = logging.getLogger(__name__)
 
-COOKIES_KEY = "twitter_cookies"
+# X's public bearer token — embedded in their web app, publicly known, stable for years
+BEARER = (
+    "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I7wlcjwHGs%3D"
+    "WqscahFyxuBVber%2BKnPAy3BCLQIByZ3sHlK7aMHHxOSeBYGGGQ0"
+)
+
+TIMELINE_URL = "https://api.twitter.com/1.1/statuses/user_timeline.json"
 
 
 class TwitterScraper:
     def __init__(self):
-        self.client = Client("en-US")
-        self._ready = False
+        cookies_raw = TWITTER_COOKIES_JSON or "{}"
+        try:
+            cookies = json.loads(cookies_raw)
+        except json.JSONDecodeError:
+            cookies = {}
+        self.auth_token = cookies.get("auth_token", "")
+        self.ct0        = cookies.get("ct0", "")
 
-    # ── Auth ────────────────────────────────────────────────────────────────────
-
-    async def _load_cookies_from_db(self) -> Optional[dict]:
-        async with get_session() as session:
-            result = await session.execute(
-                select(AppSettings).where(AppSettings.key == COOKIES_KEY)
+        if not self.auth_token or not self.ct0:
+            logger.warning(
+                "TWITTER_COOKIES_JSON is missing or incomplete. "
+                "Scraping will fail. Re-run setup_twitter.py."
             )
-            row = result.scalar_one_or_none()
-            if row:
-                return json.loads(row.value)
-        return None
 
-    async def _save_cookies_to_db(self, cookies: dict) -> None:
-        async with get_session() as session:
-            result = await session.execute(
-                select(AppSettings).where(AppSettings.key == COOKIES_KEY)
-            )
-            row = result.scalar_one_or_none()
-            if row:
-                row.value = json.dumps(cookies)
-            else:
-                session.add(AppSettings(key=COOKIES_KEY, value=json.dumps(cookies)))
+    def _headers(self) -> dict:
+        return {
+            "Authorization":  f"Bearer {BEARER}",
+            "x-csrf-token":   self.ct0,
+            "Cookie":         f"auth_token={self.auth_token}; ct0={self.ct0}",
+            "User-Agent":     (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept":         "*/*",
+            "Accept-Language":"en-US,en;q=0.9",
+            "Referer":        "https://x.com/",
+            "Origin":         "https://x.com",
+        }
 
-    async def authenticate(self) -> None:
-        """Attempt to authenticate via stored cookies, env var, or fresh login."""
-        # 1. Try env var (fastest path on cold start)
-        if TWITTER_COOKIES_JSON:
-            try:
-                cookies = json.loads(TWITTER_COOKIES_JSON)
-                self.client.set_cookies(cookies)
-                self._ready = True
-                logger.info("Twitter: loaded cookies from env var.")
-                return
-            except Exception as e:
-                logger.warning(f"Twitter: env var cookie parse failed: {e}")
-
-        # 2. Try DB
-        cookies = await _load_cookies_from_db(self)
-        if cookies:
-            try:
-                self.client.set_cookies(cookies)
-                self._ready = True
-                logger.info("Twitter: loaded cookies from database.")
-                return
-            except Exception as e:
-                logger.warning(f"Twitter: DB cookie load failed: {e}")
-
-        # 3. Fresh login
-        if not all([TWITTER_USERNAME, TWITTER_EMAIL, TWITTER_PASSWORD]):
-            raise RuntimeError(
-                "No Twitter credentials configured. "
-                "Set TWITTER_USERNAME, TWITTER_EMAIL, TWITTER_PASSWORD in env vars, "
-                "then run setup_twitter.py to generate cookies."
-            )
-        logger.info("Twitter: performing fresh login...")
-        await self.client.login(
-            auth_info_1=TWITTER_USERNAME,
-            auth_info_2=TWITTER_EMAIL,
-            password=TWITTER_PASSWORD,
-        )
-        cookies = self.client.get_cookies()
-        await self._save_cookies_to_db(cookies)
-        self._ready = True
-        logger.info("Twitter: login successful, cookies saved.")
-
-    async def _load_cookies_from_db(self) -> Optional[dict]:
-        async with get_session() as session:
-            result = await session.execute(
-                select(AppSettings).where(AppSettings.key == COOKIES_KEY)
-            )
-            row = result.scalar_one_or_none()
-            if row:
-                return json.loads(row.value)
-        return None
-
-    # ── Fetching ────────────────────────────────────────────────────────────────
+    # ── Public interface ────────────────────────────────────────────────────────
 
     async def fetch_new_tweets(self) -> List[Tweet]:
-        """
-        Fetch recent tweets for all TARGETS, filter out already-seen ones,
-        persist new ones to DB, and return the new Tweet ORM objects.
-        """
-        if not self._ready:
-            await self.authenticate()
-
+        """Fetch recent tweets for all TARGETS, persist new ones, return them."""
         all_new: List[Tweet] = []
 
-        for target in TARGETS:
-            username = target["username"]
-            name     = target["name"]
-            try:
-                tweets = await self._fetch_user_tweets(username, name)
-                new_tweets = await self._persist_new(tweets)
-                if new_tweets:
-                    logger.info(f"@{username}: {len(new_tweets)} new tweet(s).")
-                all_new.extend(new_tweets)
-            except Exception as e:
-                logger.error(f"Error fetching @{username}: {e}")
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            for target in TARGETS:
+                username = target["username"]
+                name     = target["name"]
+                try:
+                    raw = await self._fetch_timeline(client, username)
+                    new_tweets = await self._persist_new(raw, name, username)
+                    if new_tweets:
+                        logger.info(f"@{username}: {len(new_tweets)} new tweet(s).")
+                    all_new.extend(new_tweets)
+                except httpx.HTTPStatusError as e:
+                    logger.error(
+                        f"@{username}: HTTP {e.response.status_code} — "
+                        f"{e.response.text[:200]}"
+                    )
+                except Exception as e:
+                    logger.error(f"@{username}: {e}")
 
-            # Be polite — avoid hammering X's servers
-            await asyncio.sleep(3)
+                # Polite pacing
+                await asyncio.sleep(3)
 
         logger.info(f"Fetch complete. {len(all_new)} new tweets total.")
         return all_new
 
-    async def _fetch_user_tweets(self, username: str, name: str) -> List[dict]:
-        """Return raw tweet dicts for a single user."""
-        user = await self.client.get_user_by_screen_name(username)
-        raw_tweets = await user.get_tweets("Tweets", count=TWEETS_PER_USER)
+    # ── Internal helpers ────────────────────────────────────────────────────────
 
-        results = []
-        for t in raw_tweets:
-            results.append({
-                "tweet_id":        str(t.id),
-                "author_name":     name,
-                "author_username": username,
-                "text":            t.full_text or t.text or "",
-                "tweet_url":       f"https://x.com/{username}/status/{t.id}",
-                "created_at":      t.created_at_datetime or datetime.now(timezone.utc),
-            })
-        return results
+    async def _fetch_timeline(
+        self, client: httpx.AsyncClient, username: str
+    ) -> List[dict]:
+        r = await client.get(
+            TIMELINE_URL,
+            params={
+                "screen_name":    username,
+                "count":          TWEETS_PER_USER,
+                "tweet_mode":     "extended",   # gives full_text instead of truncated text
+                "exclude_replies":"true",
+                "include_rts":    "false",       # skip retweets — we want original thoughts
+            },
+            headers=self._headers(),
+        )
+        r.raise_for_status()
+        return r.json()
 
-    async def _persist_new(self, raw_tweets: List[dict]) -> List[Tweet]:
-        """Insert tweets not already in DB. Return the newly inserted rows."""
+    async def _persist_new(
+        self, raw_tweets: List[dict], name: str, username: str
+    ) -> List[Tweet]:
         if not raw_tweets:
             return []
 
-        tweet_ids = [t["tweet_id"] for t in raw_tweets]
+        tweet_ids = [str(t["id"]) for t in raw_tweets]
+
         async with get_session() as session:
             result = await session.execute(
                 select(Tweet.tweet_id).where(Tweet.tweet_id.in_(tweet_ids))
@@ -169,13 +127,30 @@ class TwitterScraper:
 
             new_objects = []
             for t in raw_tweets:
-                if t["tweet_id"] not in existing_ids:
-                    obj = Tweet(**t)
-                    session.add(obj)
-                    new_objects.append(obj)
+                tid = str(t["id"])
+                if tid in existing_ids:
+                    continue
+
+                # Parse X's date format: "Sun Apr 06 12:34:56 +0000 2025"
+                try:
+                    created = datetime.strptime(
+                        t["created_at"], "%a %b %d %H:%M:%S %z %Y"
+                    )
+                except (KeyError, ValueError):
+                    created = datetime.now(timezone.utc)
+
+                obj = Tweet(
+                    tweet_id        = tid,
+                    author_name     = name,
+                    author_username = username,
+                    text            = t.get("full_text") or t.get("text", ""),
+                    tweet_url       = f"https://x.com/{username}/status/{tid}",
+                    created_at      = created,
+                )
+                session.add(obj)
+                new_objects.append(obj)
 
             await session.flush()
-            # Refresh to get DB-assigned IDs
             for obj in new_objects:
                 await session.refresh(obj)
             return new_objects
