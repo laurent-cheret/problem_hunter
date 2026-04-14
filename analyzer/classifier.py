@@ -1,41 +1,55 @@
 """
-Problem classifier — uses Claude Haiku to classify tweets in batches.
+Problem classifier — uses Claude Haiku to classify ALL new tweets directly.
 
-Token-efficiency strategy:
-  - Keyword pre-filter runs first (zero cost).
-  - Tweets are batched (BATCH_SIZE per API call) so one call classifies many.
-  - Output is structured JSON, keeping response tokens minimal.
-  - Haiku is ~20x cheaper than Sonnet for this bulk work.
+No keyword pre-filter. Every new tweet goes to Haiku in batches of 20.
+
+Why no keyword filter:
+  - Haiku costs ~$0.003–0.008 per scan (30-80 new tweets after seeding)
+  - Keywords create false negatives: "this is so broken" fails keyword match
+    but is clearly a problem signal; Haiku understands context, keywords don't
+  - Simpler pipeline, one fewer failure point
+
+Haiku does the heavy lifting:
+  - Scores 0-10 on problem signal strength
+  - Returns is_buildable flag
+  - Writes a brief problem summary
+  - Explicitly instructed to score 0 for podcast links, personal news,
+    conference announcements, opinions without actionable gaps, etc.
 """
 
 import json
 import logging
+import re
+from datetime import datetime
 from typing import List, Tuple
 
 import anthropic
 
-from config import ANTHROPIC_API_KEY, CLASSIFIER_MODEL, BATCH_SIZE, PROBLEM_KEYWORDS
+from config import ANTHROPIC_API_KEY, CLASSIFIER_MODEL, BATCH_SIZE
 from database.models import Tweet
 
 logger = logging.getLogger(__name__)
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 SYSTEM_PROMPT = """\
-You are a product opportunity analyst. You analyse tweets from technical experts \
-to identify genuine, buildable software problems — not research ideas, not vague rants.
+You are a product-opportunity detector. You read tweets from technical experts \
+and identify ones that express a genuine, buildable software problem.
 
-For each tweet you score it 0-10 on:
-- problem_score: Does it express a real pain point or gap (10=clear specific problem, 0=no problem)
-- is_buildable: true if a developer could build a solution in <3 months with current tech
+Score each tweet 0-10 on problem_score:
+  9-10  Clear, specific pain point with an obvious software solution
+  7-8   Real frustration or gap, solution is plausible
+  5-6   Possible problem signal but vague or marginal
+  1-4   Weak signal — opinion, general complaint, no actionable gap
+  0     Not a problem: podcast/blog links, conference posts, personal news,
+        retweets of others, philosophical takes, celebratory posts, jokes
 
-Reply ONLY with a JSON array, one object per tweet, in the same order as input.
-Each object: {"idx": <int>, "problem_score": <float>, "is_buildable": <bool>, "problem_summary": "<20 words max>"}
-No markdown fences, no extra text."""
+is_buildable = true only if a developer could ship a working solution \
+in under 3 months using current tools and APIs.
 
-def keyword_prefilter(tweet: Tweet) -> bool:
-    """Free pre-filter. Returns True if the tweet might contain a problem signal."""
-    text_lower = tweet.text.lower()
-    return any(kw in text_lower for kw in PROBLEM_KEYWORDS)
+Reply ONLY with a JSON array — one object per tweet, same order as input:
+[{"idx": 0, "problem_score": 0.0, "is_buildable": false, "problem_summary": "max 20 words"},
+ ...]
+No markdown fences. No extra text. Every input tweet must have an entry."""
 
 
 def _build_user_message(tweets: List[Tweet]) -> str:
@@ -47,30 +61,27 @@ def _build_user_message(tweets: List[Tweet]) -> str:
 
 async def classify_batch(tweets: List[Tweet]) -> List[Tuple[Tweet, float, bool, str]]:
     """
-    Classify a batch of tweets. Returns list of (tweet, problem_score, is_buildable, summary).
-    Uses a single Haiku call for the whole batch.
+    Classify a batch of tweets with a single Haiku call.
+    Returns list of (tweet, problem_score, is_buildable, summary).
     """
     if not tweets:
         return []
 
-    user_msg = _build_user_message(tweets)
-
+    raw = ""
     try:
         response = client.messages.create(
             model=CLASSIFIER_MODEL,
-            max_tokens=512,  # Tiny — JSON array of short objects
+            max_tokens=1024,
             system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_msg}],
+            messages=[{"role": "user", "content": _build_user_message(tweets)}],
         )
-        import re
         raw = response.content[0].text.strip()
-        # Strip markdown code fences if the model wrapped the JSON (e.g. ```json ... ```)
+        # Strip markdown code fences if the model wrapped output
         cleaned = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.IGNORECASE)
         cleaned = re.sub(r"\n?```$", "", cleaned).strip()
         results_json: List[dict] = json.loads(cleaned)
     except (json.JSONDecodeError, IndexError) as e:
-        logger.error(f"Classifier JSON parse error: {e}. Raw: {raw[:200]}")
-        # Fallback: mark all as score 0 so they're skipped
+        logger.error(f"Classifier JSON parse error: {e}. Raw: {raw[:300]}")
         return [(t, 0.0, False, "") for t in tweets]
     except Exception as e:
         logger.error(f"Classifier API error: {e}")
@@ -89,65 +100,53 @@ async def classify_batch(tweets: List[Tweet]) -> List[Tuple[Tweet, float, bool, 
     return output
 
 
-async def classify_tweets(
-    tweets: List[Tweet],
-) -> tuple:
+async def classify_tweets(tweets: List[Tweet]) -> Tuple[List[Tweet], List[Tuple]]:
     """
-    Full classification pipeline for a list of tweets.
-    1. Keyword pre-filter (free)
-    2. Haiku batch classification
-    3. Persist scores to DB
+    Classify all tweets directly with Haiku — no keyword pre-filter.
 
     Returns:
-        (passed_tweets, keyword_passed, all_haiku_results)
-        - passed_tweets:    Tweet objects that cleared both score threshold and is_buildable
-        - keyword_passed:   Tweet objects that passed the keyword pre-filter
-        - all_haiku_results: list of (Tweet, score, is_buildable, summary) for every tweet
-                             that reached Haiku (for audit/visibility)
+        (passed_tweets, all_results)
+        - passed_tweets:  Tweet objects that cleared MIN_PROBLEM_SCORE + is_buildable
+        - all_results:    [(Tweet, score, is_buildable, summary)] for every tweet
+                          (for Telegram audit layer — you can see what scored what)
     """
-    from datetime import datetime
     from config import MIN_PROBLEM_SCORE
     from database.db import get_session
 
-    # Step 1: keyword pre-filter
-    candidates = []
-    for t in tweets:
-        passes = keyword_prefilter(t)
-        t.passed_keyword_filter = passes
-        if passes:
-            candidates.append(t)
+    if not tweets:
+        return [], []
 
-    logger.info(f"Keyword filter: {len(candidates)}/{len(tweets)} tweets passed.")
-
-    if not candidates:
-        return [], candidates, []
-
-    # Step 2: batch Haiku classification
     passed: List[Tweet] = []
-    all_haiku_results: List[Tuple[Tweet, float, bool, str]] = []
+    all_results: List[Tuple] = []
 
-    for i in range(0, len(candidates), BATCH_SIZE):
-        batch = candidates[i : i + BATCH_SIZE]
+    total_batches = (len(tweets) + BATCH_SIZE - 1) // BATCH_SIZE
+    logger.info(f"Classifying {len(tweets)} tweets in {total_batches} Haiku batch(es).")
+
+    for i in range(0, len(tweets), BATCH_SIZE):
+        batch = tweets[i : i + BATCH_SIZE]
         results = await classify_batch(batch)
-        all_haiku_results.extend(results)
+        all_results.extend(results)
 
         async with get_session() as session:
             for tweet, score, buildable, summary in results:
-                tweet.problem_score    = score
-                tweet.is_buildable     = buildable
-                tweet.problem_summary  = summary
-                tweet.classified_at    = datetime.utcnow()
+                tweet.problem_score   = score
+                tweet.is_buildable    = buildable
+                tweet.problem_summary = summary
+                tweet.classified_at   = datetime.utcnow()
 
                 if score >= MIN_PROBLEM_SCORE and buildable:
                     tweet.status = "classified"
                     passed.append(tweet)
                     logger.info(
-                        f"✓ Problem found [{score:.1f}/10] @{tweet.author_username}: {summary}"
+                        f"✓ [{score:.1f}/10] @{tweet.author_username}: {summary}"
                     )
                 else:
                     tweet.status = "skipped"
 
                 session.add(tweet)
 
-    logger.info(f"Classification done. {len(passed)} problem tweet(s) to research.")
-    return passed, candidates, all_haiku_results
+    logger.info(
+        f"Classification done. {len(passed)}/{len(tweets)} tweets passed "
+        f"(score ≥ {MIN_PROBLEM_SCORE} + is_buildable)."
+    )
+    return passed, all_results

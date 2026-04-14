@@ -174,73 +174,68 @@ async def notify_fetched_tweets(tweets: list) -> None:
     )
 
 
-async def notify_keyword_filter(all_tweets: list, passed: list) -> None:
-    """Show which tweets survived the keyword pre-filter."""
-    total = len(all_tweets)
-    n = len(passed)
-
-    if n == 0:
-        await _send(
-            f"🔎 *Layer 1 — Keyword filter*\n"
-            f"`0 / {total}` tweets passed\\. No problem keywords matched\\.",
-        )
-        return
-
-    lines = [f"🔎 *Layer 1 — Keyword filter*\n`{n} / {total}` tweets passed\n"]
-    for t in passed:
-        preview = _escape(t.text.replace("\n", " ")[:100])
-        lines.append(f"• @{_escape(t.author_username)}: _{preview}_")
-
-    # Telegram limit is 4096; split if needed
-    msg = "\n".join(lines)
-    if len(msg) <= 4000:
-        await _send(msg)
-    else:
-        # Too long — send as document instead
-        plain = f"KEYWORD FILTER — {n}/{total} passed\n\n"
-        for t in passed:
-            plain += f"@{t.author_username}\n{t.text[:200]}\n{t.tweet_url}\n\n"
-        await _send_document(
-            "keyword_filter.txt", plain,
-            f"🔎 Layer 1 — {n}/{total} tweets passed keyword filter",
-        )
-
-
 async def notify_haiku_results(all_results: list, passed: list) -> None:
     """
-    Show Haiku scores for every tweet that reached classification.
+    Show Haiku scores after classifying all new tweets (no keyword pre-filter).
+
     all_results: list of (tweet, score, is_buildable, summary)
-    passed: list of Tweet objects that cleared the threshold
+    passed:      list of Tweet objects that cleared the threshold
+
+    To keep messages readable, only shows tweets scoring >= 4 in the chat
+    message. The full dump (all scores) is always attached as a .txt document
+    so you can audit the zeroes too if needed.
     """
     if not all_results:
         return
 
-    passed_ids = {t.id for t in passed}
-    n_passed = len(passed)
-    n_total  = len(all_results)
+    passed_ids  = {t.id for t in passed}
+    n_passed    = len(passed)
+    n_total     = len(all_results)
+    sorted_res  = sorted(all_results, key=lambda x: -x[1])
 
-    lines = [f"🤖 *Layer 2 — Haiku classification*\n`{n_passed} / {n_total}` cleared threshold\n"]
-    for tweet, score, buildable, summary in sorted(all_results, key=lambda x: -x[1]):
-        badge = "✅" if tweet.id in passed_ids else "❌"
-        score_str = f"{score:.1f}"
+    # Always send the full dump as a document (every tweet, every score)
+    plain  = f"HAIKU SCORES — {n_passed}/{n_total} passed threshold\n"
+    plain += f"Showing all {n_total} classified tweets, sorted by score\n"
+    plain += "=" * 60 + "\n\n"
+    for tweet, score, buildable, summary in sorted_res:
+        badge = "PASS" if tweet.id in passed_ids else "    "
+        plain += f"[{badge}] {score:4.1f}/10  @{tweet.author_username}\n"
+        plain += f"         {summary}\n"
+        plain += f"         {tweet.tweet_url}\n\n"
+
+    await _send_document(
+        "haiku_scores.txt",
+        plain,
+        f"🤖 Haiku classification: {n_passed}/{n_total} tweets passed",
+    )
+
+    # Also send a short chat summary of anything scoring >= 4 (interesting signals)
+    notable = [(t, s, b, sm) for t, s, b, sm in sorted_res if s >= 4]
+    n_zero  = n_total - len(notable)
+
+    header = (
+        f"🤖 *Haiku classification complete*\n"
+        f"`{n_passed}/{n_total}` passed threshold \\| "
+        f"`{len(notable)}` scored ≥4 \\| "
+        f"`{n_zero}` scored below 4 \\(hidden\\)\n"
+    )
+
+    if not notable:
+        await _send(header + "\nNo tweets scored ≥4 this scan\\.")
+        return
+
+    lines = [header]
+    for tweet, score, buildable, summary in notable:
+        badge       = "✅" if tweet.id in passed_ids else "🔸"
         summary_esc = _escape((summary or "")[:80])
         lines.append(
-            f"{badge} `{score_str}/10` @{_escape(tweet.author_username)}\n"
-            f"    _{summary_esc}_"
+            f"{badge} `{score:.1f}` @{_escape(tweet.author_username)} — _{summary_esc}_"
         )
 
     msg = "\n".join(lines)
     if len(msg) <= 4000:
         await _send(msg)
-    else:
-        plain = f"HAIKU SCORES — {n_passed}/{n_total} passed\n\n"
-        for tweet, score, buildable, summary in sorted(all_results, key=lambda x: -x[1]):
-            badge = "PASS" if tweet.id in passed_ids else "SKIP"
-            plain += f"[{badge}] {score:.1f}/10 @{tweet.author_username}: {summary}\n"
-        await _send_document(
-            "haiku_scores.txt", plain,
-            f"🤖 Layer 2 — {n_passed}/{n_total} tweets passed Haiku classification",
-        )
+    # If somehow still too long (many accounts with high scores), the document covers it
 
 
 async def notify_no_findings() -> None:
