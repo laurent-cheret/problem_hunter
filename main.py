@@ -8,7 +8,10 @@ Runs an APScheduler job every SCAN_INTERVAL_HOURS hours that:
   4. Generates full reports (Sonnet, daily-capped)
   5. Sends Telegram notifications throughout
 
-Also sends a startup message to Telegram so you know the service is live.
+Telegram commands (type in your bot chat):
+  /run    — trigger the full pipeline right now
+  /stats  — show tweet/problem counts from the DB
+  /help   — list available commands
 """
 
 import asyncio
@@ -16,8 +19,10 @@ import logging
 import sys
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-from config import SCAN_INTERVAL_HOURS, TARGETS
+from config import SCAN_INTERVAL_HOURS, TARGETS, TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY
 from database.db import init_db
 from scraper.twitter import TwitterScraper
 from analyzer.classifier import classify_tweets
@@ -29,6 +34,7 @@ from bot.telegram_bot import (
     notify_report_ready, notify_no_findings,
     notify_error, notify_quota_reached,
     notify_fetched_tweets, notify_haiku_results,
+    _send, _escape,
 )
 
 logging.basicConfig(
@@ -40,12 +46,29 @@ logger = logging.getLogger(__name__)
 
 scraper = TwitterScraper()
 
+# Guard so concurrent /run commands don't stack
+_pipeline_running = False
+
 
 async def run_pipeline() -> None:
-    """Full problem-hunting pipeline. Called by the scheduler."""
+    """Full problem-hunting pipeline. Called by the scheduler or /run command."""
+    global _pipeline_running
+
+    if _pipeline_running:
+        logger.warning("Pipeline already running — skipping.")
+        return
+
+    _pipeline_running = True
     logger.info("=" * 60)
     logger.info("Pipeline starting...")
 
+    try:
+        await _run_pipeline_inner()
+    finally:
+        _pipeline_running = False
+
+
+async def _run_pipeline_inner() -> None:
     await notify_scan_start(len(TARGETS))
 
     reports_generated = 0
@@ -65,11 +88,9 @@ async def run_pipeline() -> None:
         return
 
     logger.info(f"{len(new_tweets)} new tweets to process.")
-
-    # Layer 0 visibility — show everything that was fetched
     await notify_fetched_tweets(new_tweets)
 
-    # ── 2. Classify — all tweets go directly to Haiku (no keyword pre-filter) ──
+    # ── 2. Classify — all tweets go directly to Haiku ─────────────────────────
     try:
         problem_tweets, haiku_results = await classify_tweets(new_tweets)
     except Exception as e:
@@ -77,12 +98,9 @@ async def run_pipeline() -> None:
         await notify_error("Classifier", str(e))
         problem_tweets, haiku_results = [], []
 
-    # Layer 1 visibility — Haiku scores for every tweet (sorted by score)
     await notify_haiku_results(haiku_results, problem_tweets)
 
     problems_found = len(problem_tweets)
-
-    # Notify each detected problem (above-threshold ones only)
     for tweet in problem_tweets:
         await notify_problem_detected(tweet, tweet.problem_score or 0)
 
@@ -100,9 +118,7 @@ async def run_pipeline() -> None:
         await notify_error("Researcher", str(e))
         problems = []
 
-    # Notify research results
     for problem in problems:
-        # Load associated tweet for notification
         from database.db import get_session
         from database.models import Tweet
         from sqlalchemy import select
@@ -148,17 +164,93 @@ async def run_pipeline() -> None:
     )
 
 
+# ─── Telegram command handlers ────────────────────────────────────────────────
+
+async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/run — trigger the pipeline immediately."""
+    if _pipeline_running:
+        await update.message.reply_text("⏳ Pipeline is already running — hang tight.")
+        return
+    await update.message.reply_text(
+        "🚀 Starting pipeline now... you'll get the usual notifications as it runs."
+    )
+    # Run in background so the command handler returns immediately
+    asyncio.create_task(run_pipeline())
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stats — show DB counts."""
+    try:
+        from database.db import get_session
+        from database.models import Tweet, Problem
+        from sqlalchemy import select, func
+
+        async with get_session() as session:
+            total_tweets = (await session.execute(
+                select(func.count()).select_from(Tweet)
+            )).scalar()
+
+            classified = (await session.execute(
+                select(func.count()).select_from(Tweet).where(Tweet.status == "classified")
+            )).scalar()
+
+            skipped = (await session.execute(
+                select(func.count()).select_from(Tweet).where(Tweet.status == "skipped")
+            )).scalar()
+
+            pending = (await session.execute(
+                select(func.count()).select_from(Tweet).where(Tweet.status == "pending")
+            )).scalar()
+
+            total_problems = (await session.execute(
+                select(func.count()).select_from(Problem)
+            )).scalar()
+
+            reports_sent = (await session.execute(
+                select(func.count()).select_from(Problem).where(Problem.telegram_sent == True)
+            )).scalar()
+
+        msg = (
+            f"📊 *Database stats*\n\n"
+            f"*Tweets*\n"
+            f"  Total fetched:  `{total_tweets}`\n"
+            f"  Classified ✅:  `{classified}`\n"
+            f"  Skipped ❌:     `{skipped}`\n"
+            f"  Pending ⏳:     `{pending}`\n\n"
+            f"*Problems*\n"
+            f"  Total found:    `{total_problems}`\n"
+            f"  Reports sent:   `{reports_sent}`\n\n"
+            f"*Accounts monitored:* `{len(TARGETS)}`\n"
+            f"*Scan interval:* every `{SCAN_INTERVAL_HOURS}h`\n"
+            f"*Pipeline running now:* `{'yes' if _pipeline_running else 'no'}`"
+        )
+        await update.message.reply_text(msg, parse_mode="MarkdownV2")
+
+    except Exception as e:
+        await update.message.reply_text(f"Error fetching stats: {e}")
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/help — list commands."""
+    await update.message.reply_text(
+        "🤖 *Problem Hunter commands*\n\n"
+        "/run — trigger a full scan right now\n"
+        "/stats — show tweet & problem counts from the DB\n"
+        "/help — show this message",
+        parse_mode="MarkdownV2",
+    )
+
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
 async def startup() -> None:
-    """Initialise DB and send a startup ping."""
     await init_db()
     logger.info("Problem Hunter started.")
-
-    from bot.telegram_bot import _send
-    from config import SCAN_INTERVAL_HOURS
     await _send(
         f"🚀 *Problem Hunter is running\\!*\n"
         f"Monitoring `{len(TARGETS)}` accounts every `{SCAN_INTERVAL_HOURS}h`\\.\n"
         f"Daily report cap: `3` Sonnet reports\\.\n\n"
+        f"Commands: /run /stats /help\n\n"
         f"First scan starting now\\.\\.\\."
     )
 
@@ -166,10 +258,21 @@ async def startup() -> None:
 async def main() -> None:
     await startup()
 
-    # Run once immediately on startup
+    # ── Telegram command listener ──────────────────────────────────────────────
+    tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    tg_app.add_handler(CommandHandler("run",   cmd_run))
+    tg_app.add_handler(CommandHandler("stats", cmd_stats))
+    tg_app.add_handler(CommandHandler("help",  cmd_help))
+
+    await tg_app.initialize()
+    await tg_app.start()
+    await tg_app.updater.start_polling(drop_pending_updates=True)
+    logger.info("Telegram command listener started (/run, /stats, /help).")
+
+    # ── Run once immediately on startup ───────────────────────────────────────
     await run_pipeline()
 
-    # Then schedule recurring runs
+    # ── Schedule recurring runs ───────────────────────────────────────────────
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
         run_pipeline,
@@ -182,12 +285,15 @@ async def main() -> None:
     scheduler.start()
     logger.info(f"Scheduler started. Next run in {SCAN_INTERVAL_HOURS}h.")
 
-    # Keep the process alive
+    # ── Keep alive ────────────────────────────────────────────────────────────
     try:
         while True:
             await asyncio.sleep(3600)
     except (KeyboardInterrupt, SystemExit):
         scheduler.shutdown()
+        await tg_app.updater.stop()
+        await tg_app.stop()
+        await tg_app.shutdown()
         logger.info("Shutdown complete.")
 
 
