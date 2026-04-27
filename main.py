@@ -17,6 +17,7 @@ Telegram commands (type in your bot chat):
 import asyncio
 import logging
 import sys
+from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
@@ -28,6 +29,7 @@ from scraper.twitter import TwitterScraper
 from analyzer.classifier import classify_tweets
 from researcher.validator import research_all
 from reporter.generator import generate_report, check_daily_quota
+from reporter.digest import generate_digest
 from bot.telegram_bot import (
     notify_scan_start, notify_scan_complete,
     notify_problem_detected, notify_research_result,
@@ -230,11 +232,47 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Error fetching stats: {e}")
 
 
+async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/digest — synthesise all accumulated problem signals into a strategic overview."""
+    from bot.telegram_bot import _send_document
+
+    await update.message.reply_text(
+        "🧠 Generating strategic digest across all collected signals...\n"
+        "This uses Sonnet and may take 30–60 seconds."
+    )
+
+    try:
+        digest_md = await generate_digest()
+    except Exception as e:
+        await update.message.reply_text(f"❌ Digest failed: {e}")
+        return
+
+    if not digest_md:
+        await update.message.reply_text(
+            "⚠️ No problem signals found in the DB yet. "
+            "Run a few scans first (/run) to collect data."
+        )
+        return
+
+    ts = datetime.utcnow().strftime("%Y-%m-%d")
+    filename = f"problem_digest_{ts}.md"
+
+    sent = await _send_document(
+        filename,
+        digest_md,
+        f"📊 Strategic digest — {ts}\nSonnet synthesis of all accumulated problem signals.",
+    )
+
+    if not sent:
+        await update.message.reply_text("❌ Failed to send digest document.")
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/help — list commands."""
     await update.message.reply_text(
         "🤖 *Problem Hunter commands*\n\n"
         "/run — trigger a full scan right now\n"
+        "/digest — synthesise ALL collected signals into a strategic opportunity report\n"
         "/stats — show tweet & problem counts from the DB\n"
         "/help — show this message",
         parse_mode="MarkdownV2",
@@ -250,7 +288,7 @@ async def startup() -> None:
         f"🚀 *Problem Hunter is running\\!*\n"
         f"Monitoring `{len(TARGETS)}` accounts every `{SCAN_INTERVAL_HOURS}h`\\.\n"
         f"Daily report cap: `3` Sonnet reports\\.\n\n"
-        f"Commands: /run /stats /help\n\n"
+        f"Commands: /run /digest /stats /help\n\n"
         f"First scan starting now\\.\\.\\."
     )
 
@@ -260,14 +298,15 @@ async def main() -> None:
 
     # ── Telegram command listener ──────────────────────────────────────────────
     tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    tg_app.add_handler(CommandHandler("run",   cmd_run))
-    tg_app.add_handler(CommandHandler("stats", cmd_stats))
-    tg_app.add_handler(CommandHandler("help",  cmd_help))
+    tg_app.add_handler(CommandHandler("run",    cmd_run))
+    tg_app.add_handler(CommandHandler("digest", cmd_digest))
+    tg_app.add_handler(CommandHandler("stats",  cmd_stats))
+    tg_app.add_handler(CommandHandler("help",   cmd_help))
 
     await tg_app.initialize()
     await tg_app.start()
     await tg_app.updater.start_polling(drop_pending_updates=True)
-    logger.info("Telegram command listener started (/run, /stats, /help).")
+    logger.info("Telegram command listener started (/run, /digest, /stats, /help).")
 
     # ── Run once immediately on startup ───────────────────────────────────────
     await run_pipeline()
